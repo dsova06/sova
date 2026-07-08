@@ -682,3 +682,72 @@ class TestFetchReviewsForPR:
             mock_run.return_value = ShellResult(returncode=0, stdout=data, stderr="")
             result = await _fetch_reviews_for_pr("owner/repo", 1)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# PR queue endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestPRQueueEndpoint:
+    async def test_disabled_returns_empty(self) -> None:
+        """GET /quota/pr-queue returns empty when coderabbit_quota is disabled."""
+        from httpx import ASGITransport, AsyncClient
+
+        from sova.dashboard.app import create_app
+
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/api/quota/pr-queue")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is False
+        assert data["pending"] == 0
+        assert data["entries"] == []
+
+    async def test_enabled_returns_queue_data(self) -> None:
+        """GET /quota/pr-queue returns queue entries when enabled."""
+
+        from httpx import ASGITransport, AsyncClient
+
+        from sova.config.models import ProjectConfig
+        from sova.dashboard.app import create_app
+        from sova.db.models import PRCreationQueue, PRQueueStatus
+
+        cfg = ProjectConfig(
+            github_repo="owner/repo",
+            coderabbit_quota=CodeRabbitQuotaConfig(enabled=True),
+        )
+
+        # Seed a queue entry
+        from sova.db.models import TaskRun
+        from sova.db.session import get_session
+
+        async with await get_session() as session:
+            async with session.begin():
+                tr = TaskRun(issue_number="42", role="developer", status="running")
+                session.add(tr)
+                await session.flush()
+                entry = PRCreationQueue(
+                    task_run_id=tr.id,
+                    issue_number="42",
+                    title="feat(#42): test",
+                    body="body",
+                    base_branch="main",
+                    head_branch="feat/42",
+                    repo="owner/repo",
+                    status=PRQueueStatus.PENDING,
+                    project_slug="owner/repo",
+                )
+                session.add(entry)
+
+        app = create_app()
+        with patch("sova.dashboard.routers.quota.load_config", return_value=cfg):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.get("/api/quota/pr-queue")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["pending"] == 1
+        assert len(data["entries"]) == 1
+        assert data["entries"][0]["issue_number"] == "42"

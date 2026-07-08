@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sova.config.registry import has_projects, list_projects
 from sova.dashboard.routers import (
@@ -217,8 +218,63 @@ def create_app(
             await recover_stale_runs(resolved)
             await cleanup_old_output(resolved, cfg.output.retention_days)
 
+        # Recover stale PR queue entries and start background processor(s)
+        pr_throttle_tasks: list[asyncio.Task] = []
+        if cfg.coderabbit_quota.enabled:
+            from sova.db.session import get_session
+            from sova.supervisor.pr_throttle import process_queue_loop, recover_creating_entries
+
+            if is_multi:
+                for _slug, path_str in list_projects().items():
+                    mp = Path(path_str)
+                    if not mp.is_dir():
+                        continue
+                    mcfg = load_config(mp)
+                    if not mcfg.coderabbit_quota.enabled:
+                        continue
+                    async with await get_session(project_dir=mp) as session:
+                        async with session.begin():
+                            await recover_creating_entries(session)
+
+                    def _make_factory(proj_dir: Path) -> Callable[[], Awaitable[AsyncSession]]:
+                        async def _factory() -> AsyncSession:
+                            return await get_session(project_dir=proj_dir)
+
+                        return _factory
+
+                    pr_throttle_tasks.append(
+                        asyncio.create_task(
+                            process_queue_loop(
+                                _make_factory(mp),
+                                mcfg.coderabbit_quota,
+                                project_slug=mcfg.github_repo,
+                            )
+                        )
+                    )
+            else:
+                async with await get_session(project_dir=resolved) as session:
+                    async with session.begin():
+                        await recover_creating_entries(session)
+
+                async def _pr_session_factory() -> AsyncSession:
+                    return await get_session(project_dir=resolved)
+
+                pr_throttle_tasks.append(
+                    asyncio.create_task(
+                        process_queue_loop(
+                            _pr_session_factory,
+                            cfg.coderabbit_quota,
+                            project_slug=cfg.github_repo,
+                        )
+                    )
+                )
+
         sweep_task = asyncio.create_task(_liveness_sweep_loop(project_dir, is_multi))
         yield
+        for t in pr_throttle_tasks:
+            t.cancel()
+        if pr_throttle_tasks:
+            await asyncio.gather(*pr_throttle_tasks, return_exceptions=True)
         sweep_task.cancel()
         await asyncio.gather(sweep_task, return_exceptions=True)
         await close_db()
