@@ -6508,6 +6508,32 @@ class TestCommandOutcomeValidation:
         result = await _validate_command_outcome(run_id, agent)
         assert result is None
 
+    async def test_address_pr_passes_when_git_confirms_pushed(self) -> None:
+        """Git ref comparison confirms push, skips text scanning entirely."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sova.dashboard.services.agent_db import _validate_command_outcome
+        from sova.dashboard.services.agent_pool import AgentState
+
+        async with await get_session() as session:
+            async with session.begin():
+                run = TaskRun(issue_number="312", role="command:address-pr", status="done", pr_number=102)
+                session.add(run)
+                await session.flush()
+                run_id = run.id
+
+        agent = MagicMock(spec=AgentState)
+        agent.role = "command:address-pr"
+        agent.pr_number = 102
+        agent.project_dir = None
+        with patch(
+            "sova.dashboard.services.agent_db._check_pr_branch_pushed",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await _validate_command_outcome(run_id, agent)
+        assert result is None
+
     async def test_address_pr_fails_when_git_confirms_unpushed(self) -> None:
         """Git ref comparison detects unpushed commits."""
         from unittest.mock import AsyncMock, MagicMock, patch
@@ -6515,12 +6541,12 @@ class TestCommandOutcomeValidation:
         from sova.dashboard.services.agent_db import _validate_command_outcome
         from sova.dashboard.services.agent_pool import AgentState
 
-        session = await get_session()
-        async with session.begin():
-            run = TaskRun(issue_number="313", role="command:address-pr", status="done", pr_number=103)
-            session.add(run)
-            await session.flush()
-            run_id = run.id
+        async with await get_session() as session:
+            async with session.begin():
+                run = TaskRun(issue_number="313", role="command:address-pr", status="done", pr_number=103)
+                session.add(run)
+                await session.flush()
+                run_id = run.id
 
         agent = MagicMock(spec=AgentState)
         agent.role = "command:address-pr"
